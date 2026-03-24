@@ -53,9 +53,9 @@ function startDaemon(): void {
   }
 }
 
-const IS_TELEGRAM_SESSION = !!process.env.TELEGRAM_SESSION_NAME
+const HAS_DAEMON = existsSync(DAEMON_SOCK) || isDaemonRunning()
 
-if (IS_TELEGRAM_SESSION && !isDaemonRunning()) {
+if (!HAS_DAEMON && process.env.TELEGRAM_SESSION_NAME) {
   startDaemon()
 }
 
@@ -370,7 +370,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 // Start
 // ============================================================================
 
-if (IS_TELEGRAM_SESSION) {
+if (existsSync(DAEMON_SOCK) || isDaemonRunning()) {
   await connectToDaemon()
 }
 await mcp.connect(new StdioServerTransport())
