@@ -392,6 +392,12 @@ function escapeOutsideCode(text: string): string {
   return text.replace(/([_*\[\]()~>#+\-=|{}.!\\])/g, '\\$1')
 }
 
+/** Sanitize a filename from Telegram to safe chars */
+function safeName(name?: string): string | undefined {
+  if (!name) return undefined
+  return name.replace(/[^a-zA-Z0-9._-]/g, '_')
+}
+
 // ============================================================================
 // Session Registry
 // ============================================================================
@@ -406,6 +412,9 @@ const activeSession = new Map<string, string>()
 
 /** sessionId -> last outbound reply text (for /last command) */
 const lastReply = new Map<string, string>()
+
+/** request_id -> permission details for "See more" expansion */
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
 
 /** sessionName -> chatId that requested /new (auto-activate on connect) */
 const pendingActivation = new Map<string, string>()
@@ -585,7 +594,7 @@ async function handleSessionsCommand(ctx: Context): Promise<void> {
 // ============================================================================
 
 function isCommand(text: string): boolean {
-  return /^\/(new|switch|kill|sessions|last|projects)/.test(text)
+  return /^\/(new|switch|kill|sessions|last|projects|start|help|status)/.test(text)
 }
 
 async function handleProjectsCommand(ctx: Context, args: string): Promise<void> {
@@ -653,7 +662,63 @@ async function handleLastCommand(ctx: Context): Promise<void> {
   await ctx.reply(`Last from "${session.name}":\n\n${preview}`)
 }
 
-async function routeToSession(ctx: Context, text: string, imagePath?: string): Promise<void> {
+async function handleStartCommand(ctx: Context): Promise<void> {
+  if (ctx.chat?.type !== 'private') return
+  const access = loadAccess()
+  if (access.dmPolicy === 'disabled') {
+    await ctx.reply(`This bot isn't accepting new connections.`)
+    return
+  }
+  await ctx.reply(
+    `This bot bridges Telegram to Claude Code sessions.\n\n` +
+    `To pair:\n` +
+    `1. DM me anything — you'll get a 6-char code\n` +
+    `2. In Claude Code: /telegram-sessions:access pair <code>\n\n` +
+    `After that, use /new to start a Claude session.`
+  )
+}
+
+async function handleHelpCommand(ctx: Context): Promise<void> {
+  if (ctx.chat?.type !== 'private') return
+  await ctx.reply(
+    `Messages you send here route to a paired Claude Code session. ` +
+    `Text, photos, documents and voice messages are forwarded.\n\n` +
+    `/new [name] — start a new Claude session\n` +
+    `/switch — switch between sessions\n` +
+    `/sessions — list active sessions\n` +
+    `/last — show last reply from current session\n` +
+    `/projects — manage saved projects\n` +
+    `/kill <name> — kill a session\n` +
+    `/status — check your pairing state`
+  )
+}
+
+async function handleStatusCommand(ctx: Context): Promise<void> {
+  if (ctx.chat?.type !== 'private') return
+  const from = ctx.from
+  if (!from) return
+  const senderId = String(from.id)
+  const access = loadAccess()
+
+  if (access.allowFrom.includes(senderId)) {
+    const name = from.username ? `@${from.username}` : senderId
+    await ctx.reply(`Paired as ${name}.`)
+    return
+  }
+
+  for (const [code, p] of Object.entries(access.pending)) {
+    if (p.senderId === senderId) {
+      await ctx.reply(
+        `Pending pairing — run in Claude Code:\n\n/telegram-sessions:access pair ${code}`
+      )
+      return
+    }
+  }
+
+  await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
+}
+
+async function routeToSession(ctx: Context, text: string, imagePath?: string, attachment?: { file_id: string; name?: string; mime?: string; size?: number }): Promise<void> {
   const chatId = String(ctx.chat!.id)
   const from = ctx.from!
   const msgId = ctx.message?.message_id
@@ -682,6 +747,12 @@ async function routeToSession(ctx: Context, text: string, imagePath?: string): P
     text,
     ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
     ...(imagePath ? { image_path: imagePath } : {}),
+    ...(attachment ? {
+      attachment_file_id: attachment.file_id,
+      attachment_name: attachment.name,
+      attachment_mime: attachment.mime,
+      attachment_size: attachment.size,
+    } : {}),
   }
 
   session.socket.write(encode(msg))
@@ -691,6 +762,7 @@ async function handleInbound(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
+  attachment?: { kind: string; file_id: string; size?: number; mime?: string; name?: string },
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -744,11 +816,25 @@ async function handleInbound(
       case 'projects':
         await handleProjectsCommand(ctx, args)
         return
+      case 'start':
+        await handleStartCommand(ctx)
+        return
+      case 'help':
+        await handleHelpCommand(ctx)
+        return
+      case 'status':
+        await handleStatusCommand(ctx)
+        return
     }
   }
 
   const imagePath = downloadImage ? await downloadImage() : undefined
-  await routeToSession(ctx, text, imagePath)
+  await routeToSession(ctx, text, imagePath, attachment ? {
+    file_id: attachment.file_id,
+    name: attachment.name,
+    mime: attachment.mime,
+    size: attachment.size,
+  } : undefined)
 }
 
 // ============================================================================
@@ -782,15 +868,83 @@ bot.on('message:photo', async (ctx) => {
   })
 })
 
+bot.on('message:document', async (ctx) => {
+  const doc = ctx.message.document
+  const name = safeName(doc.file_name)
+  const text = ctx.message.caption ?? `(document: ${name ?? 'file'})`
+  await handleInbound(ctx, text, undefined, {
+    kind: 'document',
+    file_id: doc.file_id,
+    size: doc.file_size,
+    mime: doc.mime_type,
+    name,
+  })
+})
+
+bot.on('message:voice', async (ctx) => {
+  const voice = ctx.message.voice
+  const text = ctx.message.caption ?? '(voice message)'
+  await handleInbound(ctx, text, undefined, {
+    kind: 'voice',
+    file_id: voice.file_id,
+    size: voice.file_size,
+    mime: voice.mime_type,
+  })
+})
+
 bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data
 
   // Handle permission verdict buttons
   if (data.startsWith('perm:')) {
-    const match = data.match(/^perm:(allow|deny):(.+)$/)
-    if (!match) return
-    const behavior = match[1] as 'allow' | 'deny'
-    const requestId = match[2]
+    const match = data.match(/^perm:(allow|deny|more):(.+)$/)
+    if (!match) {
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+
+    // Security: verify sender is in allowFrom
+    const access = loadAccess()
+    const senderId = String(ctx.from.id)
+    if (!access.allowFrom.includes(senderId)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+
+    const [, action, requestId] = match
+
+    // Handle "See more" expansion
+    if (action === 'more') {
+      const details = pendingPermissions.get(requestId)
+      if (!details) {
+        await ctx.answerCallbackQuery({ text: 'Details no longer available.' }).catch(() => {})
+        return
+      }
+      const { tool_name, description, input_preview } = details
+      let prettyInput: string
+      try {
+        prettyInput = JSON.stringify(JSON.parse(input_preview), null, 2)
+      } catch {
+        prettyInput = input_preview
+      }
+      const expanded =
+        `🔐 Permission: ${tool_name}\n\n` +
+        `tool_name: ${tool_name}\n` +
+        `description: ${description}\n` +
+        `input_preview:\n${prettyInput}`
+      await ctx.editMessageText(expanded, {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Allow', callback_data: `perm:allow:${requestId}` },
+            { text: '❌ Deny', callback_data: `perm:deny:${requestId}` },
+          ]],
+        },
+      }).catch(() => {})
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+
+    const behavior = action as 'allow' | 'deny'
     const chatId = String(ctx.chat!.id)
     const session = getActiveSessionForChat(chatId)
 
@@ -805,10 +959,10 @@ bot.on('callback_query:data', async (ctx) => {
       behavior,
     } as DaemonToServer))
 
+    pendingPermissions.delete(requestId)
     const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
-    await ctx.answerCallbackQuery({ text: label })
+    await ctx.answerCallbackQuery({ text: label }).catch(() => {})
     try {
-      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } })
       const original = ctx.callbackQuery.message?.text ?? ''
       await ctx.editMessageText(`${original}\n\n${label}`)
     } catch {}
@@ -848,8 +1002,34 @@ bot.on('callback_query:data', async (ctx) => {
 
 async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): Promise<void> {
   switch (msg.type) {
+    case 'download_attachment': {
+      try {
+        const file = await bot.api.getFile(msg.file_id)
+        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+        const res = await fetch(url)
+        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+        const buf = Buffer.from(await res.arrayBuffer())
+        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+        mkdirSync(INBOX_DIR, { recursive: true })
+        writeFileSync(path, buf)
+        session.socket.write(
+          encode({ type: 'result', ok: true, data: path } as DaemonToServer),
+        )
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        session.socket.write(
+          encode({ type: 'result', ok: false, error: `download_attachment failed: ${errMsg}` } as DaemonToServer),
+        )
+      }
+      return
+    }
+
     case 'reply': {
-      const { chat_id, text, reply_to, files = [] } = msg
+      const { chat_id, text, reply_to, files = [], format } = msg
       try {
         assertAllowedChat(chat_id)
         for (const f of files) {
@@ -869,8 +1049,11 @@ async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): P
         )
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const escaped = escapeMarkdownV2(text)
-        const chunks = chunk(escaped, limit, mode)
+        const useRawMarkdown = format === 'markdownv2'
+        const parseMode = useRawMarkdown ? 'MarkdownV2' as const : 'MarkdownV2' as const
+        const formattedText = useRawMarkdown ? text : escapeMarkdownV2(text)
+        const chunks = chunk(formattedText, limit, mode)
+        const plainChunks = useRawMarkdown ? undefined : chunk(text, limit, mode)
         const sentIds: number[] = []
         const replyToNum = reply_to != null ? Number(reply_to) : undefined
 
@@ -881,12 +1064,13 @@ async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): P
           let sent
           try {
             sent = await bot.api.sendMessage(chat_id, chunks[i], {
-              parse_mode: 'MarkdownV2',
+              parse_mode: parseMode,
               ...replyParams,
             })
           } catch {
             // Fallback to plain text if MarkdownV2 parsing fails
-            sent = await bot.api.sendMessage(chat_id, chunk(text, limit, mode)[i], {
+            const fallback = plainChunks ? plainChunks[i] : chunks[i]
+            sent = await bot.api.sendMessage(chat_id, fallback, {
               ...replyParams,
             })
           }
@@ -948,40 +1132,21 @@ async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): P
 
     case 'permission_request': {
       const { request_id, tool_name, description, input_preview } = msg
-      // Find all chats where this session is active
-      for (const [chatId, sid] of activeSession.entries()) {
-        if (sid === session.sessionId) {
-          const escaped = escapeMarkdownV2(
-            `🔐 Permission request (${session.name})\n\nTool: ${tool_name}\n${description}\n`,
-          ) + '```\n' + input_preview + '\n```'
-          void (async () => {
-            try {
-              await bot.api.sendMessage(chatId, escaped, {
-                parse_mode: 'MarkdownV2',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: '✅ Allow', callback_data: `perm:allow:${request_id}` },
-                    { text: '❌ Deny', callback_data: `perm:deny:${request_id}` },
-                  ]],
-                },
-              })
-            } catch {
-              // Fallback to plain text
-              await bot.api.sendMessage(
-                chatId,
-                `🔐 Permission request (${session.name})\n\nTool: ${tool_name}\n${description}\n${input_preview}`,
-                {
-                  reply_markup: {
-                    inline_keyboard: [[
-                      { text: '✅ Allow', callback_data: `perm:allow:${request_id}` },
-                      { text: '❌ Deny', callback_data: `perm:deny:${request_id}` },
-                    ]],
-                  },
-                },
-              )
-            }
-          })()
-        }
+      pendingPermissions.set(request_id, { tool_name, description, input_preview })
+      const text = `🔐 Permission: ${tool_name} (${session.name})`
+      const keyboard = {
+        inline_keyboard: [[
+          { text: 'See more', callback_data: `perm:more:${request_id}` },
+          { text: '✅ Allow', callback_data: `perm:allow:${request_id}` },
+          { text: '❌ Deny', callback_data: `perm:deny:${request_id}` },
+        ]],
+      }
+      // Send to allowlisted DM users only (not groups — security)
+      const access = loadAccess()
+      for (const chatId of access.allowFrom) {
+        void bot.api.sendMessage(chatId, text, { reply_markup: keyboard }).catch(e => {
+          process.stderr.write(`permission_request send to ${chatId} failed: ${e}\n`)
+        })
       }
       return
     }
@@ -989,13 +1154,14 @@ async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): P
     case 'edit': {
       try {
         assertAllowedChat(msg.chat_id)
-        const escapedText = escapeMarkdownV2(msg.text)
+        const useRawMd = msg.format === 'markdownv2'
+        const formatted = useRawMd ? msg.text : escapeMarkdownV2(msg.text)
         let edited
         try {
           edited = await bot.api.editMessageText(
             msg.chat_id,
             Number(msg.message_id),
-            escapedText,
+            formatted,
             { parse_mode: 'MarkdownV2' },
           )
         } catch {
@@ -1159,6 +1325,9 @@ void bot.start({
     botUsername = info.username
     process.stderr.write(`telegram-sessions daemon: polling as @${info.username}\n`)
     await bot.api.setMyCommands([
+      { command: 'start', description: 'Pairing instructions' },
+      { command: 'help', description: 'Available commands' },
+      { command: 'status', description: 'Check your pairing state' },
       { command: 'new', description: 'Start a session (/new [--skip-permissions] [--continue] name)' },
       { command: 'switch', description: 'Switch between active sessions' },
       { command: 'sessions', description: 'List all active sessions' },

@@ -90,6 +90,10 @@ function setupSocket(socket: Socket): void {
               user_id: msg.user_id,
               ts: msg.ts,
               ...(msg.image_path ? { image_path: msg.image_path } : {}),
+              ...(msg.attachment_file_id ? { attachment_file_id: msg.attachment_file_id } : {}),
+              ...(msg.attachment_name ? { attachment_name: msg.attachment_name } : {}),
+              ...(msg.attachment_mime ? { attachment_mime: msg.attachment_mime } : {}),
+              ...(msg.attachment_size ? { attachment_size: msg.attachment_size } : {}),
             },
           },
         })
@@ -177,17 +181,19 @@ function sendAndWait(msg: ServerToDaemon): Promise<Extract<DaemonToServer, { typ
 // ============================================================================
 
 const mcp = new Server(
-  { name: 'telegram-sessions', version: '0.2.0' },
+  { name: 'telegram-sessions', version: '0.3.0' },
   {
     capabilities: { tools: {}, experimental: { 'claude/channel': {}, 'claude/channel/permission': {} } },
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool.',
       '',
       'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">.',
-      'Reply with the reply tool — pass chat_id back.',
+      'If the tag has an image_path attribute, Read that file — it is a photo the sender attached.',
+      'If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path.',
+      'Reply with the reply tool — pass chat_id back. Use reply_to only when replying to an earlier message; omit for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments.',
-      'Use react to add emoji reactions, and edit_message to update a message you previously sent.',
+      'Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — send a new reply when a long task completes.',
       '',
       'Format replies using markdown: **bold**, *italic*, `code`, ```code blocks```, [links](url).',
       'The daemon converts to Telegram format automatically — just write standard markdown.',
@@ -226,16 +232,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Reply on Telegram. Pass chat_id from the inbound message.',
+      description:
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           chat_id: { type: 'string' as const },
           text: { type: 'string' as const },
-          reply_to: { type: 'string' as const, description: 'Message ID to thread under.' },
+          reply_to: {
+            type: 'string' as const,
+            description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
           files: {
             type: 'array' as const, items: { type: 'string' as const },
-            description: 'Absolute file paths to attach.',
+            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+          },
+          format: {
+            type: 'string' as const,
+            enum: ['text', 'markdownv2'],
+            description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (auto-escaped markdown).",
           },
         },
         required: ['chat_id', 'text'],
@@ -243,7 +258,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'react',
-      description: 'Add an emoji reaction to a Telegram message.',
+      description: 'Add an emoji reaction to a Telegram message. Telegram only accepts a fixed whitelist (👍 👎 ❤ 🔥 👀 🎉 etc).',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -255,14 +270,30 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'download_attachment',
+      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          file_id: { type: 'string' as const, description: 'The attachment_file_id from inbound meta' },
+        },
+        required: ['file_id'],
+      },
+    },
+    {
       name: 'edit_message',
-      description: 'Edit a message the bot previously sent.',
+      description: 'Edit a message the bot previously sent. Edits don\'t trigger push notifications — send a new reply when a long task completes so the user\'s device pings.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           chat_id: { type: 'string' as const },
           message_id: { type: 'string' as const },
           text: { type: 'string' as const },
+          format: {
+            type: 'string' as const,
+            enum: ['text', 'markdownv2'],
+            description: "Rendering mode. 'markdownv2' enables Telegram formatting. Default: 'text' (auto-escaped markdown).",
+          },
         },
         required: ['chat_id', 'message_id', 'text'],
       },
@@ -275,12 +306,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   try {
     switch (req.params.name) {
       case 'reply': {
+        const format = (args.format as string | undefined) ?? 'text'
         const result = await sendAndWait({
           type: 'reply',
           chat_id: args.chat_id as string,
           text: args.text as string,
           reply_to: args.reply_to as string | undefined,
           files: args.files as string[] | undefined,
+          format: format as 'text' | 'markdownv2',
         })
         if (!result.ok) throw new Error(result.error)
         return { content: [{ type: 'text' as const, text: result.data! }] }
@@ -295,12 +328,22 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (!result.ok) throw new Error(result.error)
         return { content: [{ type: 'text' as const, text: result.data! }] }
       }
+      case 'download_attachment': {
+        const result = await sendAndWait({
+          type: 'download_attachment',
+          file_id: args.file_id as string,
+        })
+        if (!result.ok) throw new Error(result.error)
+        return { content: [{ type: 'text' as const, text: result.data! }] }
+      }
       case 'edit_message': {
+        const editFormat = (args.format as string | undefined) ?? 'text'
         const result = await sendAndWait({
           type: 'edit',
           chat_id: args.chat_id as string,
           message_id: args.message_id as string,
           text: args.text as string,
+          format: editFormat as 'text' | 'markdownv2',
         })
         if (!result.ok) throw new Error(result.error)
         return { content: [{ type: 'text' as const, text: result.data! }] }

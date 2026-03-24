@@ -75,6 +75,9 @@ Now only approved users can reach Claude through the bot.
 
 | Command | Description |
 |---------|-------------|
+| `/start` | Pairing instructions |
+| `/help` | List available commands |
+| `/status` | Check your pairing state |
 | `/new [name] [--skip-permissions] [--continue]` | Start a new Claude session (runs in tmux) |
 | `/switch` | Switch between active sessions |
 | `/sessions` | List all active sessions |
@@ -84,11 +87,15 @@ Now only approved users can reach Claude through the bot.
 | `/projects remove <name>` | Remove a saved project |
 | `/kill <name>` | Kill a session |
 
-Regular messages are routed to the active session. Claude replies directly in the chat with markdown formatting.
+Regular messages are routed to the active session. Text, photos, documents, and voice messages are forwarded. Claude replies directly in the chat with markdown formatting.
 
 ### Permissions
 
-When a session requires tool approval (running without `--skip-permissions`), the bot sends an interactive message with **Allow** / **Deny** buttons. The verdict is forwarded back to the Claude session in real time.
+When a session requires tool approval (running without `--skip-permissions`), the bot sends an interactive message with **See more** / **Allow** / **Deny** buttons. "See more" expands the full tool details with pretty-printed input. Only allowlisted users can approve permissions. The verdict is forwarded back to the Claude session in real time.
+
+### File attachments
+
+Photos are downloaded eagerly on arrival and the local path is included in the notification. Documents and voice messages include `attachment_file_id` in the metadata — use the `download_attachment` tool to fetch them to the local inbox (Telegram caps bot downloads at 20MB).
 
 ## Access management
 
@@ -141,7 +148,7 @@ Telegram ← Bot API → Daemon (grammy, unix socket server)
 ```
 
 - **Daemon** (`src/daemon.ts`) — single long-running process. Holds the Telegram bot connection, manages session registry, routes messages, handles commands.
-- **MCP Server** (`src/server.ts`) — one per Claude session. Connects to daemon via unix socket, exposes `reply`, `react`, `edit_message` tools. Forwards permission requests between Claude and the daemon.
+- **MCP Server** (`src/server.ts`) — one per Claude session. Connects to daemon via unix socket, exposes `reply`, `react`, `edit_message`, `download_attachment` tools. Forwards permission requests between Claude and the daemon.
 - **Shared** (`src/shared.ts`) — paths, protocol types, helpers.
 
 State is stored in `~/.claude/channels/telegram-sessions/`:

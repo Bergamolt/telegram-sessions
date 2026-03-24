@@ -23,9 +23,10 @@ export const PLUGIN_ROOT = join(new URL('..', import.meta.url).pathname)
 
 export type ServerToDaemon =
   | { type: 'register'; sessionId: string; name?: string; cwd?: string }
-  | { type: 'reply'; chat_id: string; text: string; reply_to?: string; files?: string[] }
+  | { type: 'reply'; chat_id: string; text: string; reply_to?: string; files?: string[]; format?: 'text' | 'markdownv2' }
   | { type: 'react'; chat_id: string; message_id: string; emoji: string }
-  | { type: 'edit'; chat_id: string; message_id: string; text: string }
+  | { type: 'edit'; chat_id: string; message_id: string; text: string; format?: 'text' | 'markdownv2' }
+  | { type: 'download_attachment'; file_id: string }
   | { type: 'permission_request'; request_id: string; tool_name: string; description: string; input_preview: string }
 
 // ============================================================================
@@ -42,6 +43,10 @@ export type DaemonToServer =
       text: string
       ts: string
       image_path?: string
+      attachment_file_id?: string
+      attachment_name?: string
+      attachment_mime?: string
+      attachment_size?: number
     }
   | { type: 'session_activated' }
   | { type: 'session_deactivated' }
