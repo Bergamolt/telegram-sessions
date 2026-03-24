@@ -75,12 +75,20 @@ Now only approved users can reach Claude through the bot.
 
 | Command | Description |
 |---------|-------------|
-| `/new [name]` | Start a new Claude session (runs in tmux) |
+| `/new [name] [--skip-permissions] [--continue]` | Start a new Claude session (runs in tmux) |
 | `/switch` | Switch between active sessions |
 | `/sessions` | List all active sessions |
+| `/last` | Show the last reply from the current session |
+| `/projects` | List saved projects |
+| `/projects add <name> <path>` | Save a project (used as cwd for `/new <name>`) |
+| `/projects remove <name>` | Remove a saved project |
 | `/kill <name>` | Kill a session |
 
 Regular messages are routed to the active session. Claude replies directly in the chat with markdown formatting.
+
+### Permissions
+
+When a session requires tool approval (running without `--skip-permissions`), the bot sends an interactive message with **Allow** / **Deny** buttons. The verdict is forwarded back to the Claude session in real time.
 
 ## Access management
 
@@ -133,7 +141,7 @@ Telegram ← Bot API → Daemon (grammy, unix socket server)
 ```
 
 - **Daemon** (`src/daemon.ts`) — single long-running process. Holds the Telegram bot connection, manages session registry, routes messages, handles commands.
-- **MCP Server** (`src/server.ts`) — one per Claude session. Connects to daemon via unix socket, exposes `reply`, `react`, `edit_message` tools.
+- **MCP Server** (`src/server.ts`) — one per Claude session. Connects to daemon via unix socket, exposes `reply`, `react`, `edit_message` tools. Forwards permission requests between Claude and the daemon.
 - **Shared** (`src/shared.ts`) — paths, protocol types, helpers.
 
 State is stored in `~/.claude/channels/telegram-sessions/`:
@@ -177,4 +185,5 @@ Configure via `/telegram-sessions:access set`:
 | `textChunkLimit` | number | 4096 | Max message length before splitting |
 | `chunkMode` | `length`, `newline` | `length` | How to split long messages |
 | `mentionPatterns` | JSON array | none | Extra patterns to trigger bot in groups |
-| `workspace` | path | plugin root | Working directory for new sessions |
+| `workspace` | path | plugin root | Default working directory for new sessions |
+| `projects` | `{ name: path }` | `{}` | Named projects — `/new <name>` uses the project path as cwd |

@@ -100,6 +100,7 @@ type Access = {
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
   workspace?: string
+  projects?: Record<string, string>
 }
 
 function defaultAccess(): Access {
@@ -148,6 +149,7 @@ function readAccessFile(): Access {
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
       workspace: parsed.workspace,
+      projects: parsed.projects,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -402,6 +404,12 @@ const sessions = new Map<string, ConnectedSession>()
 /** chatId -> sessionId (which session is active for each chat) */
 const activeSession = new Map<string, string>()
 
+/** sessionId -> last outbound reply text (for /last command) */
+const lastReply = new Map<string, string>()
+
+/** sessionName -> chatId that requested /new (auto-activate on connect) */
+const pendingActivation = new Map<string, string>()
+
 function getActiveSessionForChat(chatId: string): ConnectedSession | undefined {
   const sid = activeSession.get(chatId)
   if (!sid) return undefined
@@ -458,7 +466,7 @@ function findClaudeTelegram(): string | null {
   }
 }
 
-async function handleNewCommand(ctx: Context, label?: string): Promise<void> {
+async function handleNewCommand(ctx: Context, label?: string, opts?: { skipPermissions?: boolean; continue?: boolean }): Promise<void> {
   const id = generateSessionId()
   const name = label || `claude-${id}`
   const tmuxSession = name
@@ -466,13 +474,18 @@ async function handleNewCommand(ctx: Context, label?: string): Promise<void> {
   try {
     const pluginRoot = PLUGIN_ROOT.replace(/\/$/, '')
     const access = loadAccess()
-    const rawCwd = access.workspace ?? pluginRoot
+    const projects = access.projects ?? {}
+    const projectPath = projects[name]
+    const rawCwd = projectPath ?? access.workspace ?? pluginRoot
     const cwd = rawCwd.startsWith('~') ? rawCwd.replace('~', homedir()) : rawCwd
 
     const claudeTelegramBin = findClaudeTelegram()
+    const extraFlags: string[] = []
+    if (opts?.skipPermissions) extraFlags.push('--skip-permissions')
+    if (opts?.continue) extraFlags.push('--continue')
     const claudeCmd = claudeTelegramBin
-      ? `${claudeTelegramBin} --name ${name} --skip-permissions`
-      : `TELEGRAM_SESSION_NAME=${name} claude --dangerously-load-development-channels server:telegram-sessions --dangerously-skip-permissions`
+      ? `${claudeTelegramBin} --name ${name}${extraFlags.length ? ' ' + extraFlags.join(' ') : ''}`
+      : `TELEGRAM_SESSION_NAME=${name} claude --dangerously-load-development-channels server:telegram-sessions${opts?.skipPermissions ? ' --dangerously-skip-permissions' : ''}${opts?.continue ? ' --continue' : ''}`
 
     // Create tmux session with the claude command (wrap in shell so env vars are interpreted)
     const child = spawn('tmux', ['new-session', '-d', '-s', tmuxSession, '-c', cwd, 'sh', '-c', claudeCmd], {
@@ -493,6 +506,7 @@ async function handleNewCommand(ctx: Context, label?: string): Promise<void> {
     return
   }
 
+  pendingActivation.set(name, String(ctx.chat!.id))
   await ctx.reply(`Session started: ${name}\nWaiting for Claude to connect...`)
 }
 
@@ -571,7 +585,49 @@ async function handleSessionsCommand(ctx: Context): Promise<void> {
 // ============================================================================
 
 function isCommand(text: string): boolean {
-  return /^\/(new|switch|kill|sessions)/.test(text)
+  return /^\/(new|switch|kill|sessions|last|projects)/.test(text)
+}
+
+async function handleProjectsCommand(ctx: Context, args: string): Promise<void> {
+  const access = loadAccess()
+  const projects = access.projects ?? {}
+
+  if (!args) {
+    // List projects
+    const entries = Object.entries(projects)
+    if (entries.length === 0) {
+      await ctx.reply('No saved projects.\n\nUsage:\n/projects add <name> <path>\n/projects remove <name>')
+      return
+    }
+    const lines = entries.map(([name, path]) => `- ${name} → ${path}`)
+    await ctx.reply(`Projects:\n${lines.join('\n')}\n\nUse: /new <project-name>`)
+    return
+  }
+
+  const addMatch = args.match(/^add\s+(\S+)\s+(.+)$/)
+  if (addMatch) {
+    const [, name, path] = addMatch
+    access.projects = { ...projects, [name]: path }
+    saveAccess(access)
+    await ctx.reply(`Project "${name}" saved → ${path}`)
+    return
+  }
+
+  const removeMatch = args.match(/^(?:remove|rm|del)\s+(\S+)$/)
+  if (removeMatch) {
+    const name = removeMatch[1]
+    if (!projects[name]) {
+      await ctx.reply(`Project "${name}" not found.`)
+      return
+    }
+    delete projects[name]
+    access.projects = projects
+    saveAccess(access)
+    await ctx.reply(`Project "${name}" removed.`)
+    return
+  }
+
+  await ctx.reply('Usage:\n/projects — list\n/projects add <name> <path>\n/projects remove <name>')
 }
 
 function parseCommand(text: string): { cmd: string; args: string } {
@@ -579,6 +635,22 @@ function parseCommand(text: string): { cmd: string; args: string } {
   const match = text.match(/^\/(\w+)(?:@\w+)?\s*(.*)$/)
   if (!match) return { cmd: '', args: '' }
   return { cmd: match[1], args: match[2].trim() }
+}
+
+async function handleLastCommand(ctx: Context): Promise<void> {
+  const chatId = String(ctx.chat!.id)
+  const session = getActiveSessionForChat(chatId)
+  if (!session) {
+    await ctx.reply('No active session. Use /new to start one.')
+    return
+  }
+  const last = lastReply.get(session.sessionId)
+  if (!last) {
+    await ctx.reply(`No messages yet from session "${session.name}".`)
+    return
+  }
+  const preview = last.length > 4000 ? last.slice(-4000) + '...' : last
+  await ctx.reply(`Last from "${session.name}":\n\n${preview}`)
 }
 
 async function routeToSession(ctx: Context, text: string, imagePath?: string): Promise<void> {
@@ -650,9 +722,13 @@ async function handleInbound(
   if (isCommand(text)) {
     const { cmd, args } = parseCommand(text)
     switch (cmd) {
-      case 'new':
-        await handleNewCommand(ctx, args || undefined)
+      case 'new': {
+        const skipPermissions = /--skip-permissions\b/.test(args)
+        const cont = /--continue\b/.test(args)
+        const name = args.replace(/--(skip-permissions|continue)\s*/g, '').trim() || undefined
+        await handleNewCommand(ctx, name, { skipPermissions, continue: cont })
         return
+      }
       case 'switch':
         await handleSwitchCommand(ctx)
         return
@@ -661,6 +737,12 @@ async function handleInbound(
         return
       case 'sessions':
         await handleSessionsCommand(ctx)
+        return
+      case 'last':
+        await handleLastCommand(ctx)
+        return
+      case 'projects':
+        await handleProjectsCommand(ctx, args)
         return
     }
   }
@@ -702,6 +784,37 @@ bot.on('message:photo', async (ctx) => {
 
 bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data
+
+  // Handle permission verdict buttons
+  if (data.startsWith('perm:')) {
+    const match = data.match(/^perm:(allow|deny):(.+)$/)
+    if (!match) return
+    const behavior = match[1] as 'allow' | 'deny'
+    const requestId = match[2]
+    const chatId = String(ctx.chat!.id)
+    const session = getActiveSessionForChat(chatId)
+
+    if (!session) {
+      await ctx.answerCallbackQuery({ text: 'No active session.' })
+      return
+    }
+
+    session.socket.write(encode({
+      type: 'permission_verdict',
+      request_id: requestId,
+      behavior,
+    } as DaemonToServer))
+
+    const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
+    await ctx.answerCallbackQuery({ text: label })
+    try {
+      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } })
+      const original = ctx.callbackQuery.message?.text ?? ''
+      await ctx.editMessageText(`${original}\n\n${label}`)
+    } catch {}
+    return
+  }
+
   if (!data.startsWith('switch:')) return
 
   const sessionId = data.slice('switch:'.length)
@@ -796,6 +909,8 @@ async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): P
           }
         }
 
+        lastReply.set(session.sessionId, text)
+
         const result =
           sentIds.length === 1
             ? `sent (id: ${sentIds[0]})`
@@ -827,6 +942,46 @@ async function handleOutbound(msg: ServerToDaemon, session: ConnectedSession): P
         session.socket.write(
           encode({ type: 'result', ok: false, error: `react failed: ${errMsg}` } as DaemonToServer),
         )
+      }
+      return
+    }
+
+    case 'permission_request': {
+      const { request_id, tool_name, description, input_preview } = msg
+      // Find all chats where this session is active
+      for (const [chatId, sid] of activeSession.entries()) {
+        if (sid === session.sessionId) {
+          const escaped = escapeMarkdownV2(
+            `🔐 Permission request (${session.name})\n\nTool: ${tool_name}\n${description}\n`,
+          ) + '```\n' + input_preview + '\n```'
+          void (async () => {
+            try {
+              await bot.api.sendMessage(chatId, escaped, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: '✅ Allow', callback_data: `perm:allow:${request_id}` },
+                    { text: '❌ Deny', callback_data: `perm:deny:${request_id}` },
+                  ]],
+                },
+              })
+            } catch {
+              // Fallback to plain text
+              await bot.api.sendMessage(
+                chatId,
+                `🔐 Permission request (${session.name})\n\nTool: ${tool_name}\n${description}\n${input_preview}`,
+                {
+                  reply_markup: {
+                    inline_keyboard: [[
+                      { text: '✅ Allow', callback_data: `perm:allow:${request_id}` },
+                      { text: '❌ Deny', callback_data: `perm:deny:${request_id}` },
+                    ]],
+                  },
+                },
+              )
+            }
+          })()
+        }
       }
       return
     }
@@ -905,9 +1060,32 @@ const socketServer = createServer((socket: Socket) => {
 
         socket.write(encode({ type: 'result', ok: true, data: 'registered' } as DaemonToServer))
 
+        // If this session was created via /new, auto-activate for the requesting chat
+        const pendingChatId = pendingActivation.get(session.name)
+        if (pendingChatId) {
+          pendingActivation.delete(session.name)
+          const previousSid = activeSession.get(pendingChatId)
+          if (previousSid && previousSid !== msg.sessionId) {
+            const prev = sessions.get(previousSid)
+            if (prev) prev.socket.write(encode({ type: 'session_deactivated' } as DaemonToServer))
+          }
+          activeSession.set(pendingChatId, msg.sessionId)
+          session.socket.write(encode({ type: 'session_activated' } as DaemonToServer))
+        }
+
+        // Auto-activate for chats that don't have an active session
+        for (const chatId of getAllowedChatIds()) {
+          if (!getActiveSessionForChat(chatId)) {
+            activeSession.set(chatId, msg.sessionId)
+            session.socket.write(encode({ type: 'session_activated' } as DaemonToServer))
+          }
+        }
+
         // Notify all allowed chats that a session connected
         for (const chatId of getAllowedChatIds()) {
-          void bot.api.sendMessage(chatId, `Session "${session.name}" connected.`).catch(() => {})
+          const isActive = activeSession.get(chatId) === msg.sessionId
+          const suffix = isActive ? ' (active)' : ''
+          void bot.api.sendMessage(chatId, `Session "${session.name}" connected.${suffix}`).catch(() => {})
         }
         continue
       }
@@ -981,9 +1159,11 @@ void bot.start({
     botUsername = info.username
     process.stderr.write(`telegram-sessions daemon: polling as @${info.username}\n`)
     await bot.api.setMyCommands([
-      { command: 'new', description: 'Start a new Claude session (optional: /new name)' },
+      { command: 'new', description: 'Start a session (/new [--skip-permissions] [--continue] name)' },
       { command: 'switch', description: 'Switch between active sessions' },
       { command: 'sessions', description: 'List all active sessions' },
+      { command: 'last', description: 'Show last message from current session' },
+      { command: 'projects', description: 'Manage saved projects (/projects add name path)' },
       { command: 'kill', description: 'Kill a session (/kill name-or-id)' },
     ])
   },

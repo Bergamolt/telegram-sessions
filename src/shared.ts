@@ -26,6 +26,7 @@ export type ServerToDaemon =
   | { type: 'reply'; chat_id: string; text: string; reply_to?: string; files?: string[] }
   | { type: 'react'; chat_id: string; message_id: string; emoji: string }
   | { type: 'edit'; chat_id: string; message_id: string; text: string }
+  | { type: 'permission_request'; request_id: string; tool_name: string; description: string; input_preview: string }
 
 // ============================================================================
 // Protocol: Daemon → MCP Server
@@ -45,6 +46,7 @@ export type DaemonToServer =
   | { type: 'session_activated' }
   | { type: 'session_deactivated' }
   | { type: 'result'; ok: boolean; data?: string; error?: string }
+  | { type: 'permission_verdict'; request_id: string; behavior: 'allow' | 'deny' }
 
 // ============================================================================
 // Session Registry (daemon-internal)

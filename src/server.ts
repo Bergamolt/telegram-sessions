@@ -94,6 +94,15 @@ function setupSocket(socket: Socket): void {
           },
         })
       }
+      if (msg.type === 'permission_verdict') {
+        void mcp.notification({
+          method: 'notifications/claude/channel/permission',
+          params: {
+            request_id: msg.request_id,
+            behavior: msg.behavior,
+          },
+        })
+      }
       if (msg.type === 'session_activated') {
         process.stderr.write('telegram-sessions: this session is now active\n')
       }
@@ -170,7 +179,7 @@ function sendAndWait(msg: ServerToDaemon): Promise<Extract<DaemonToServer, { typ
 const mcp = new Server(
   { name: 'telegram-sessions', version: '0.1.0' },
   {
-    capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
+    capabilities: { tools: {}, experimental: { 'claude/channel': {}, 'claude/channel/permission': {} } },
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool.',
       '',
@@ -191,6 +200,27 @@ const mcp = new Server(
     ].join('\n'),
   },
 )
+
+// Listen for permission_request notifications from Claude Code
+mcp.fallbackNotificationHandler = async (notification) => {
+  if (notification.method === 'notifications/claude/channel/permission_request') {
+    const params = notification.params as {
+      request_id: string
+      tool_name: string
+      description: string
+      input_preview: string
+    }
+    if (connected) {
+      daemonSocket.write(encode({
+        type: 'permission_request',
+        request_id: params.request_id,
+        tool_name: params.tool_name,
+        description: params.description,
+        input_preview: params.input_preview,
+      }))
+    }
+  }
+}
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
