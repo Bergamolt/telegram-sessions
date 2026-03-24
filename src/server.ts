@@ -370,7 +370,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 // Start
 // ============================================================================
 
-if (IS_TELEGRAM_SESSION) {
+if (IS_TELEGRAM_SESSION || (existsSync(DAEMON_SOCK) && isDaemonRunning())) {
   await connectToDaemon()
 }
 await mcp.connect(new StdioServerTransport())
