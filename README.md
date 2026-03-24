@@ -86,8 +86,9 @@ Now only approved users can reach Claude through the bot.
 | `/projects add <name> <path>` | Save a project (used as cwd for `/new <name>`) |
 | `/projects remove <name>` | Remove a saved project |
 | `/kill <name>` | Kill a session |
+| `/restart` | Restart the daemon |
 
-Regular messages are routed to the active session. Text, photos, documents, and voice messages are forwarded. Claude replies directly in the chat with markdown formatting.
+Regular messages are routed to the active session. Text, photos, documents, voice messages, and audio files are forwarded. Claude replies directly in the chat with markdown formatting.
 
 ### Permissions
 
@@ -95,7 +96,23 @@ When a session requires tool approval (running without `--skip-permissions`), th
 
 ### File attachments
 
-Photos are downloaded eagerly on arrival and the local path is included in the notification. Documents and voice messages include `attachment_file_id` in the metadata — use the `download_attachment` tool to fetch them to the local inbox (Telegram caps bot downloads at 20MB).
+Photos are downloaded eagerly on arrival and the local path is included in the notification. Documents, voice messages, and audio files include `attachment_file_id` in the metadata — use the `download_attachment` tool to fetch them to the local inbox (Telegram caps bot downloads at 20MB).
+
+### Voice transcription
+
+Configure a shell command to automatically transcribe voice and audio messages. When set, Claude will download the file and run the command to get the transcript.
+
+```
+/telegram-sessions:access set transcribe whisper --model base --output_format txt --output_dir -
+```
+
+The command receives the file path as the last argument and should output the transcript to stdout. Any tool that follows this contract works — [OpenAI Whisper](https://github.com/openai/whisper), a custom script, etc.
+
+To disable:
+
+```
+/telegram-sessions:access set transcribe ""
+```
 
 ## Access management
 
@@ -194,3 +211,4 @@ Configure via `/telegram-sessions:access set`:
 | `mentionPatterns` | JSON array | none | Extra patterns to trigger bot in groups |
 | `workspace` | path | plugin root | Default working directory for new sessions |
 | `projects` | `{ name: path }` | `{}` | Named projects — `/new <name>` uses the project path as cwd |
+| `transcribe` | shell command | none | Transcription command for voice/audio messages |
