@@ -495,6 +495,18 @@ async function handleNewCommand(ctx: Context, label?: string, opts?: { skipPermi
   const tmuxSession = name
 
   try {
+    // Kill orphaned tmux session if it exists but isn't registered with the daemon
+    const isOrphan = !([...sessions.values()].some(s => s.name === name))
+    if (isOrphan) {
+      try {
+        const check = Bun.spawnSync(['tmux', 'has-session', '-t', tmuxSession])
+        if (check.exitCode === 0) {
+          const kill = spawn('tmux', ['kill-session', '-t', tmuxSession], { stdio: 'ignore' })
+          await new Promise<void>(resolve => kill.on('close', () => resolve()))
+        }
+      } catch {}
+    }
+
     const pluginRoot = PLUGIN_ROOT.replace(/\/$/, '')
     const access = loadAccess()
     const projects = access.projects ?? {}
@@ -615,7 +627,7 @@ async function handleSessionCommand(ctx: Context): Promise<void> {
 // ============================================================================
 
 function isCommand(text: string): boolean {
-  return /^\/(new|kill|sessions?|last|projects|start|help|status|restart)/.test(text)
+  return /^\/(new|kill|sessions?|last|projects|start|help|status|restart|tab|plan)/.test(text)
 }
 
 async function handleProjectsCommand(ctx: Context, args: string): Promise<void> {
@@ -683,6 +695,62 @@ async function handleLastCommand(ctx: Context): Promise<void> {
   await ctx.reply(`Last from "${session.name}":\n\n${preview}`)
 }
 
+async function sendKeysToTmux(tmuxSession: string, ...keys: string[]): Promise<void> {
+  const child = spawn('tmux', ['send-keys', '-t', tmuxSession, ...keys], { stdio: 'ignore' })
+  await new Promise<void>((resolve) => child.on('close', () => resolve()))
+}
+
+function captureTmuxPane(tmuxSession: string): string {
+  try {
+    const { stdout } = Bun.spawnSync(['tmux', 'capture-pane', '-t', tmuxSession, '-e', '-p'])
+    return stdout.toString()
+  } catch {
+    return ''
+  }
+}
+
+function parseStatusLine(capture: string): string | null {
+  // Strip ANSI codes and look for the status line at the bottom of the pane
+  const lines = capture.split('\n').map(l => l.replace(/\x1b\[[0-9;]*m/g, '').trim()).filter(Boolean)
+  // The status line typically contains model info, mode indicators like "auto-accept edits", "plan", etc.
+  // Look from the bottom for a line that looks like a status bar
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 5); i--) {
+    const line = lines[i]
+    if (/shift\+tab|auto.accept|bypass|plan mode|opus|sonnet|haiku|medium|effort/i.test(line)) {
+      return line
+    }
+  }
+  return null
+}
+
+async function handleTabCommand(ctx: Context): Promise<void> {
+  const chatId = String(ctx.chat!.id)
+  const session = getActiveSessionForChat(chatId)
+  if (!session) {
+    await ctx.reply('No active session. Use /new to start one.')
+    return
+  }
+  await sendKeysToTmux(session.name, 'BTab')
+  // Brief delay for the UI to update
+  await new Promise(resolve => setTimeout(resolve, 300))
+  const capture = captureTmuxPane(session.name)
+  const status = parseStatusLine(capture)
+  const statusMsg = status ? `\n\nStatus: ${status}` : ''
+  await ctx.reply(`Sent Shift+Tab to "${session.name}"${statusMsg}`)
+}
+
+async function handlePlanCommand(ctx: Context): Promise<void> {
+  const chatId = String(ctx.chat!.id)
+  const session = getActiveSessionForChat(chatId)
+  if (!session) {
+    await ctx.reply('No active session. Use /new to start one.')
+    return
+  }
+  await sendKeysToTmux(session.name, 'Escape')
+  await sendKeysToTmux(session.name, '/plan', 'Enter')
+  await ctx.reply(`Sent /plan to "${session.name}"`)
+}
+
 async function handleStartCommand(ctx: Context): Promise<void> {
   if (ctx.chat?.type !== 'private') return
   const access = loadAccess()
@@ -710,6 +778,8 @@ async function handleHelpCommand(ctx: Context): Promise<void> {
     `/last — show last reply from current session\n` +
     `/projects — manage saved projects\n` +
     `/kill <name> — kill a session\n` +
+    `/tab — cycle permission mode (Shift+Tab)\n` +
+    `/plan — toggle plan mode\n` +
     `/restart — restart the daemon\n` +
     `/status — check your pairing state`
   )
@@ -864,6 +934,12 @@ async function handleInbound(
         return
       case 'status':
         await handleStatusCommand(ctx)
+        return
+      case 'tab':
+        await handleTabCommand(ctx)
+        return
+      case 'plan':
+        await handlePlanCommand(ctx)
         return
       case 'restart':
         await ctx.reply('Restarting daemon...')
@@ -1373,20 +1449,27 @@ process.on('SIGINT', shutdown)
 // ============================================================================
 
 void bot.start({
+  drop_pending_updates: true,
   onStart: async (info) => {
     botUsername = info.username
     process.stderr.write(`telegram-sessions daemon: polling as @${info.username}\n`)
-    await bot.api.setMyCommands([
-      { command: 'new', description: 'Start a session (/new [--skip-permissions] [--continue] name)' },
-      { command: 'sessions', description: 'List & switch between sessions' },
-      { command: 'session', description: 'Info about current session' },
-      { command: 'last', description: 'Show last message from current session' },
-      { command: 'kill', description: 'Kill a session (/kill name-or-id)' },
-      { command: 'projects', description: 'Manage saved projects (/projects add name path)' },
-      { command: 'status', description: 'Check your pairing state' },
-      { command: 'restart', description: 'Restart the daemon' },
-      { command: 'help', description: 'Available commands' },
-      { command: 'start', description: 'Pairing instructions' },
-    ])
+    try {
+      await bot.api.setMyCommands([
+        { command: 'new', description: 'Start a session (/new [--skip-permissions] [--continue] name)' },
+        { command: 'sessions', description: 'List & switch between sessions' },
+        { command: 'session', description: 'Info about current session' },
+        { command: 'last', description: 'Show last message from current session' },
+        { command: 'kill', description: 'Kill a session (/kill name-or-id)' },
+        { command: 'tab', description: 'Cycle permission mode (Shift+Tab)' },
+        { command: 'plan', description: 'Toggle plan mode' },
+        { command: 'projects', description: 'Manage saved projects (/projects add name path)' },
+        { command: 'status', description: 'Check your pairing state' },
+        { command: 'restart', description: 'Restart the daemon' },
+        { command: 'help', description: 'Available commands' },
+        { command: 'start', description: 'Pairing instructions' },
+      ])
+    } catch (e) {
+      process.stderr.write(`telegram-sessions daemon: setMyCommands failed: ${e}\n`)
+    }
   },
 })
